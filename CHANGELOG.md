@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.7.0] - 2026-03-02
+
+### Added
+
+- 🖥️ **Interactive terminal sessions** — full PTY-based terminal accessible via WebSocket, following the JupyterLab/Kubernetes resource pattern. `POST /api/terminals` to create a session, `GET /api/terminals` to list, `DELETE /api/terminals/{id}` to kill, and `WS /api/terminals/{id}` to attach. Non-blocking I/O ensures the terminal never starves other API requests. Sessions are automatically cleaned up on disconnect.
+
 ## [0.6.0] - 2026-03-02
 
 ### Added

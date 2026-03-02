@@ -17,7 +17,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
-from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -26,6 +26,17 @@ from pypdf import PdfReader
 
 from open_terminal.env import API_KEY, BINARY_FILE_MIME_PREFIXES, CORS_ALLOWED_ORIGINS, LOG_DIR
 from open_terminal.runner import PipeRunner, ProcessRunner, create_runner
+
+try:
+    import fcntl
+    import pty
+    import struct
+    import subprocess
+    import termios
+
+    _PTY_AVAILABLE = True
+except ImportError:
+    _PTY_AVAILABLE = False  # Windows
 
 
 def get_system_info() -> str:
@@ -1097,3 +1108,229 @@ async def kill_process(
         background_process.exit_code = exit_code
     del _processes[process_id]
     return {"status": "killed"}
+
+
+# ---------------------------------------------------------------------------
+# Interactive terminal sessions (resource-oriented API)
+# ---------------------------------------------------------------------------
+
+import select
+import uuid as _uuid
+from datetime import datetime as _datetime
+
+# Active terminal sessions: {id: {master_fd, process, created_at, pid}}
+_terminal_sessions: dict[str, dict] = {}
+
+
+def _cleanup_session(session_id: str):
+    """Clean up a terminal session's resources."""
+    session = _terminal_sessions.pop(session_id, None)
+    if session is None:
+        return
+    try:
+        os.close(session["master_fd"])
+    except OSError:
+        pass
+    process = session["process"]
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+
+
+@app.post("/api/terminals", dependencies=[Depends(verify_api_key)], include_in_schema=False)
+async def create_terminal(request: Request):
+    """Create a new terminal session and return its ID."""
+    if not _PTY_AVAILABLE:
+        return JSONResponse(
+            {"error": "PTY not available on this platform"}, status_code=503
+        )
+
+    session_id = str(_uuid.uuid4())[:8]
+    master_fd, slave_fd = pty.openpty()
+    fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+
+    shell = os.environ.get("SHELL", "/bin/sh")
+    process = subprocess.Popen(
+        [shell],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        cwd=os.getcwd(),
+        env=os.environ.copy(),
+        start_new_session=True,
+    )
+    os.close(slave_fd)
+
+    # Set non-blocking
+    flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
+    fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+    _terminal_sessions[session_id] = {
+        "master_fd": master_fd,
+        "process": process,
+        "created_at": _datetime.utcnow().isoformat() + "Z",
+        "pid": process.pid,
+    }
+
+    return {
+        "id": session_id,
+        "created_at": _terminal_sessions[session_id]["created_at"],
+        "pid": process.pid,
+    }
+
+
+@app.get("/api/terminals", dependencies=[Depends(verify_api_key)], include_in_schema=False)
+async def list_terminals(request: Request):
+    """List active terminal sessions."""
+    result = []
+    to_remove = []
+    for sid, session in _terminal_sessions.items():
+        if session["process"].poll() is not None:
+            to_remove.append(sid)
+            continue
+        result.append({
+            "id": sid,
+            "created_at": session["created_at"],
+            "pid": session["pid"],
+        })
+    for sid in to_remove:
+        _cleanup_session(sid)
+    return result
+
+
+@app.get("/api/terminals/{session_id}", dependencies=[Depends(verify_api_key)], include_in_schema=False)
+async def get_terminal(session_id: str, request: Request):
+    """Get info about a terminal session."""
+    session = _terminal_sessions.get(session_id)
+    if session is None:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    if session["process"].poll() is not None:
+        _cleanup_session(session_id)
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    return {
+        "id": session_id,
+        "created_at": session["created_at"],
+        "pid": session["pid"],
+    }
+
+
+@app.delete("/api/terminals/{session_id}", dependencies=[Depends(verify_api_key)], include_in_schema=False)
+async def delete_terminal(session_id: str, request: Request):
+    """Kill and remove a terminal session."""
+    if session_id not in _terminal_sessions:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    _cleanup_session(session_id)
+    return {"status": "deleted"}
+
+
+@app.websocket("/api/terminals/{session_id}")
+async def ws_terminal(ws: WebSocket, session_id: str):
+    """Attach to an existing terminal session via WebSocket.
+
+    Authentication is via **first-message auth**: after connecting, the client
+    must send a JSON text frame as its first message::
+
+        {"type": "auth", "token": "<api_key>"}
+
+    The server validates the token and closes the connection if invalid.
+    After authentication, the client sends keystrokes as **binary** frames
+    and receives PTY output as binary frames.
+
+    To resize, send a **text** JSON frame::
+
+        {"type": "resize", "cols": 120, "rows": 40}
+    """
+    session = _terminal_sessions.get(session_id)
+    if session is None:
+        await ws.close(code=4004, reason="Session not found")
+        return
+
+    if session["process"].poll() is not None:
+        _cleanup_session(session_id)
+        await ws.close(code=4004, reason="Session has ended")
+        return
+
+    await ws.accept()
+
+    # First-message authentication
+    if API_KEY:
+        try:
+            msg = await asyncio.wait_for(ws.receive_text(), timeout=10.0)
+            payload = json.loads(msg)
+            if payload.get("type") != "auth" or payload.get("token") != API_KEY:
+                await ws.close(code=4001, reason="Invalid API key")
+                return
+        except (asyncio.TimeoutError, json.JSONDecodeError, Exception):
+            await ws.close(code=4001, reason="Auth timeout or invalid payload")
+            return
+
+    master_fd = session["master_fd"]
+    process = session["process"]
+    loop = asyncio.get_event_loop()
+    stop_event = asyncio.Event()
+
+    def _blocking_read():
+        """Read from PTY using select() so we don't block forever."""
+        while not stop_event.is_set():
+            try:
+                rlist, _, _ = select.select([master_fd], [], [], 0.1)
+                if rlist:
+                    return os.read(master_fd, 4096)
+            except (OSError, ValueError):
+                return b""
+        return b""
+
+    async def _pty_reader():
+        """Forward PTY output -> WebSocket."""
+        try:
+            while not stop_event.is_set():
+                data = await loop.run_in_executor(None, _blocking_read)
+                if not data:
+                    if stop_event.is_set():
+                        break
+                    if process.poll() is not None:
+                        break
+                    continue
+                try:
+                    await ws.send_bytes(data)
+                except Exception:
+                    break
+        finally:
+            pass
+
+    reader_task = asyncio.create_task(_pty_reader())
+
+    try:
+        while True:
+            msg = await ws.receive()
+            if msg["type"] == "websocket.disconnect":
+                break
+            elif "bytes" in msg and msg["bytes"]:
+                await loop.run_in_executor(None, os.write, master_fd, msg["bytes"])
+            elif "text" in msg and msg["text"]:
+                try:
+                    payload = json.loads(msg["text"])
+                    if payload.get("type") == "resize":
+                        cols = payload.get("cols", 80)
+                        rows = payload.get("rows", 24)
+                        fcntl.ioctl(
+                            master_fd,
+                            termios.TIOCSWINSZ,
+                            struct.pack("HHHH", rows, cols, 0, 0),
+                        )
+                except (json.JSONDecodeError, KeyError):
+                    pass
+    except WebSocketDisconnect:
+        pass
+    finally:
+        stop_event.set()
+        reader_task.cancel()
+        try:
+            await reader_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        # Clean up session on disconnect
+        _cleanup_session(session_id)
