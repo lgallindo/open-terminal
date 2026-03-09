@@ -98,7 +98,7 @@ def run(
         click.echo("=" * 60)
     click.echo()
 
-    uvicorn.run("open_terminal.main:app", host=host, port=port)
+    uvicorn.run("open_terminal.main:app", host=host, port=port, loop="asyncio")
 
 
 @main.command()
